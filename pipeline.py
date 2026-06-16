@@ -38,25 +38,21 @@ FROM gaiadr3.gaia_source
 WHERE source_id = {source_id}
 """.format(
     corr_cols=",\n    ".join(_CORR_COLS),
-    source_id="{source_id}",         
+    source_id="{source_id}",
 )
 
 
 def _build_covariance(row: dict) -> np.ndarray:
     """
-    construct the 5×5 astrometric covariance matrix from the
-    individual errors and pairwise correlation coefficients stored
-    in the Gaia archive.
+    Construct the 5×5 astrometric covariance matrix from the individual
+    errors and pairwise correlation coefficients stored in the Gaia archive.
 
-    parameters : (ra, dec, parallax, pmra, pmdec)
-    Units            (mas, mas, mas, mas/yr, mas/yr)
-
-    ra_error in the archive is in mas 
+    Parameters: (ra, dec, parallax, pmra, pmdec)
+    Units: (mas, mas, mas, mas/yr, mas/yr)
     """
     params  = ["ra", "dec", "parallax", "pmra", "pmdec"]
-    errors  = np.array([row[f"{p}_error"] for p in params])  
+    errors  = np.array([row[f"{p}_error"] for p in params])
 
-    # correlation matrix (symmetric, diagonal = 1)
     corr_map = {
         (0, 1): row["ra_dec_corr"],
         (0, 2): row["ra_parallax_corr"],
@@ -75,31 +71,19 @@ def _build_covariance(row: dict) -> np.ndarray:
         C[i, j] = rho
         C[j, i] = rho
 
-    # convert correlation matrix to covariance matrix: Σ_ij = ρ_ij * σ_i * σ_j
     cov = C * np.outer(errors, errors)
     return cov
 
 
 def query_gaia_archive(source_id: int | str) -> dict:
     """
-    query the Gaia DR3 archive for astrometric + photometric parameters.
-
-    parameters
-    source_id 
-
-    returns
-    dict with keys:
-        source_id, ra, dec, parallax, pmra, pmdec,
-        ra_error, dec_error, parallax_error, pmra_error, pmdec_error,
-        ruwe, g_mag, astrometric_n_good_obs_al, astrometric_chi2_al, 
-        covariance_matrix  (5×5 numpy array)
+    Query the Gaia DR3 archive for astrometric + photometric parameters.
     """
     adql = _ADQL_QUERY.format(source_id=int(source_id))
     job  = Gaia.launch_job_async(adql)
     tbl  = job.get_results()
 
     row = {col: tbl[col][0] for col in tbl.colnames}
-
     cov = _build_covariance(row)
 
     params = {
@@ -125,118 +109,57 @@ def query_gaia_archive(source_id: int | str) -> dict:
 
 def compute_parallax_factor(t_tcb: np.ndarray, ra_deg: float, dec_deg: float) -> np.ndarray:
     """
-    compute the Gaia along-scan (AL) parallax factor
+    Compute the Gaia along-scan (AL) parallax factor.
 
-    AL parallax factor:
-
-        f(t) = sin(ψ) · X_bary(t) + cos(ψ) · Y_bary(t)
-        
-        f(t) = cos(δ) · cos(α) · X⊕(t)
-             + cos(δ) · sin(α) · Y⊕(t)
-             + sin(δ) · Z⊕(t)
-
-    X⊕, Y⊕, Z⊕ : barycentric position of the Earth (≈ Gaia) in AU
-    (α, δ) : star's RA/Dec in radians.  
-
-    result is dimensionless. 
-    multiplying by parallax gives the AL displacement in mas at each epoch.
-
-    parameters
-    t_tcb : np.ndarray
-        observation times as Gaia Julian days
-
-    ra_deg, dec_deg : float
-        target ICRS coordinates in degrees.
-
-    returns
-    parallax_factor : np.ndarray  
+        f(t) = cos(δ)·cos(α)·X⊕(t) + cos(δ)·sin(α)·Y⊕(t) + sin(δ)·Z⊕(t)
     """
-
-    # Convert Gaia days to standard Julian Date
     GAIA_TCB_ORIGIN_JD = 2455197.5
     jd_tcb = t_tcb + GAIA_TCB_ORIGIN_JD
 
-    # astropy Time in TCB scale
     times = Time(jd_tcb, format="jd", scale="tcb")
 
-    # barycentric position of Earth in AU 
-    earth_bary = get_body_barycentric("earth", times)   
-    X = earth_bary.x.to(u.au).value   
+    earth_bary = get_body_barycentric("earth", times)
+    X = earth_bary.x.to(u.au).value
     Y = earth_bary.y.to(u.au).value
     Z = earth_bary.z.to(u.au).value
 
-    # direction cosines of the target star
     ra_rad  = np.deg2rad(ra_deg)
     dec_rad = np.deg2rad(dec_deg)
     l_x = np.cos(dec_rad) * np.cos(ra_rad)
     l_y = np.cos(dec_rad) * np.sin(ra_rad)
     l_z = np.sin(dec_rad)
 
-    # AL parallax factor 
     parallax_factor = l_x * X + l_y * Y + l_z * Z
     return parallax_factor
 
 
 def query_scanning_law(ra_deg: float, dec_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    return the Gaia DR3 scanning-law time series for a sky position.
-
-    parameters
-    ra_deg, dec_deg : float
-        ICRS coordinates of the target in degrees.
-
-    returns
-    -------
-    t_tcb : np.ndarray
-        observation times in Gaia's time system
-    scan_angle : np.ndarray
-        scan-position angle in radians 
-    parallax_factor : np.ndarray
-        along-scan parallax factor, dimensionless.
-
-    gaiaunlimited returns individual CCD rows.
+    Return the Gaia DR3 scanning-law time series for a sky position.
     """
-
     sl = GaiaScanningLaw()
-
-    """
-    GaiaScanningLaw.query(ra_deg, dec_deg) returns a LIST of pandas
-    one DataFrame per Gaia field-of-view pass (two FoVs per transit: preceding and following).  
-    concatenate them
-    """
     result = sl.query(ra_deg, dec_deg)
 
     spin_phase = np.asarray(result[0], dtype=float)
     t_tcb      = np.asarray(result[1], dtype=float)
-    
-    # result[0] and result[1] may differ in length by 1 due to how
-    # gaiaunlimited pads its output arrays. Trim to the shorter length.
+
     n = min(len(spin_phase), len(t_tcb))
     spin_phase = spin_phase[:n]
     t_tcb      = t_tcb[:n]
 
-    # wrap cumulative spin phase → instantaneous scan position angle ψ ∈ [0, 2π]
     scan_angle = spin_phase % (2 * np.pi)
-
     parallax_factor = compute_parallax_factor(t_tcb, ra_deg, dec_deg)
-    
-    # sort chronologically
+
     order = np.argsort(t_tcb)
     return t_tcb[order], scan_angle[order], parallax_factor[order]
 
+    
+
+
 def query_companion(source_id: int | str) -> dict:
     """
-    combines the archive query (astrometry, photometry, RUWE, covariance)
+    Combines the archive query (astrometry, photometry, RUWE, covariance)
     with the scanning-law query (times, scan angles, parallax factors).
-
-    parameters
-    source_id 
-
-    returns
-    dict with all fields documented in query_gaia_archive() plus:
-        t_obs            : observation times 
-        scan_angle       : ψ(t) in radians
-        parallax_factor  : f(t), dimensionless AL parallax factor
     """
     print(f"[1/2] Querying Gaia DR3 archive for source_id = {source_id} ...")
     params = query_gaia_archive(source_id)
@@ -282,24 +205,11 @@ def print_summary(params: dict) -> None:
     print("=" * 60 + "\n")
 
 
+# =============================================================================
+# Part 2: Forward Modeling Gaia Along-Scan Positions
+# =============================================================================
 
-
-
-"""
-forward_model.py  —  Part 2: Forward Modeling Gaia Along-Scan Positions
-PyTensor-compatible implementation of the single-star and planet-companion AL forward models.
-
-part 1 returns t_obs 
-
-AL observation equation
-  AL(t) = (ra_off + pmra·t_yr) · sin(ψ)
-         + (dec_off + pmdec·t_yr) · cos(ψ)
-         + ϖ · f(t)
-"""
-
-import numpy as np
 import pytensor.tensor as pt
-
 
 GAIA_EPOCH_OFFSET_DAYS = 2192.0   # TCB days from 2010-01-01 to J2016.0
 DAYS_PER_YEAR          = 365.25
@@ -312,14 +222,10 @@ def tcb_days_to_yr2016(t_tcb_days):
 
 def _eccentric_anomaly_pt(t_yr, period_yr, eccentricity, t_p_yr, steps=6):
     """
-    solve Kepler's equation for eccentric anomaly E via Newton–Raphson.
-
-    M = 2π · (t - t_p) / P   (mean anomaly)
-    E - e·sin(E) = M          (Kepler's equation)
+    Solve Kepler's equation for eccentric anomaly E via Newton–Raphson.
     """
     M = pt.mod((t_yr - t_p_yr) / period_yr * TWO_PI, TWO_PI)
-
-    E = M + 0.0  # copy avoids mutation of M
+    E = M + 0.0
     for i in range(steps):
         E = E - (E - eccentricity * pt.sin(E) - M) / (1.0 - eccentricity * pt.cos(E))
     return E
@@ -327,11 +233,7 @@ def _eccentric_anomaly_pt(t_yr, period_yr, eccentricity, t_p_yr, steps=6):
 
 def _orbital_xy_pt(t_yr, period_yr, eccentricity, t_p_yr):
     """
-    compute dimensionless Thiele-Innes orbital coordinates X, Y.
-
-      X = cos(E) - e
-      Y = sqrt(1 - e²) · sin(E)
-
+    Compute dimensionless Thiele-Innes orbital coordinates X, Y.
     """
     E = _eccentric_anomaly_pt(t_yr, period_yr, eccentricity, t_p_yr)
     X = pt.cos(E) - eccentricity
@@ -341,8 +243,7 @@ def _orbital_xy_pt(t_yr, period_yr, eccentricity, t_p_yr):
 
 def _thiele_innes_pt(semimajor_mas, inclination_deg, Omega_deg, omega_deg):
     """
-    compute Thiele-Innes coefficients A, B, F, G in mas.
-
+    Compute Thiele-Innes coefficients A, B, F, G in mas.
     """
     i = pt.deg2rad(inclination_deg)
     W = pt.deg2rad(Omega_deg)
@@ -361,28 +262,7 @@ def _photocenter_offset_pt(
     mass_ratio, lum_ratio
 ):
     """
-    photocenter offset (Δα*, Δδ) in mas due to the companion's orbital motion.
-
-      Δα* = (B·X + G·Y) · w_lum
-      Δδ  = (A·X + F·Y) · w_lum
-      w_lum = |q - l| / [(1 + l)(1 + q)]
-
-      
-    parameters
-
-    t_yr          : observation times in years since J2016.0  (pt tensor)
-    semimajor_mas : semi-major axis in mas = semimajor_au * parallax_mas
-    period_yr     : orbital period in years  (Kepler's 3rd law)
-    eccentricity  : orbital eccentricity
-    inclination_deg, Omega_deg, omega_deg : orbital angles in degrees
-    t_p_yr        : time of periastron in years since J2016.0
-    mass_ratio    : q = Mp / Ms
-    lum_ratio     : l = L_planet / L_star  (≈ 0 for dark companions)
-
-    
-    returns
-
-    dra_mas, ddec_mas
+    Photocenter offset (Δα*, Δδ) in mas due to the companion's orbital motion.
     """
     A, B, F, G = _thiele_innes_pt(semimajor_mas, inclination_deg, Omega_deg, omega_deg)
     X, Y       = _orbital_xy_pt(t_yr, period_yr, eccentricity, t_p_yr)
@@ -395,113 +275,37 @@ def _photocenter_offset_pt(
 
 
 def single_star(
-    t_tcb_days,
-    scan_angle,
-    parallax_factor,
-    ra_off,
-    dec_off,
-    pmra,
-    pmdec,
-    parallax_mas,
+    t_tcb_days, scan_angle, parallax_factor,
+    ra_off, dec_off, pmra, pmdec, parallax_mas,
 ):
     """
     Gaia AL positions for a single-star model.
 
-    AL(t) = (ra_off + pmra·t_yr) · sin(ψ)
-           + (dec_off + pmdec·t_yr) · cos(ψ)
-           + ϖ · f(t)
-
-           
-    parameters
-  
-    t_tcb_days      : Gaia TCB days since 2010-01-01  (numpy array or pt tensor)
-    scan_angle      : scan-position angle ψ(t) in radians  (numpy array or pt tensor)
-    parallax_factor : AL parallax factor f(t), dimensionless  (numpy array or pt tensor)
-    ra_off          : RA offset at J2016.0 (mas)  — pt scalar in PyMC context
-    dec_off         : Dec offset at J2016.0 (mas)
-    pmra            : proper motion in RA·cos(Dec) (mas/yr)
-    pmdec           : proper motion in Dec (mas/yr)
-    parallax_mas    : parallax ϖ (mas)
-
-    
-    returns
-    -------
-    AL_star
+    AL(t) = (ra_off + pmra·t_yr)·sin(ψ) + (dec_off + pmdec·t_yr)·cos(ψ) + ϖ·f(t)
     """
     t_yr = tcb_days_to_yr2016(t_tcb_days)
-
     dra  = ra_off  + pmra  * t_yr
     ddec = dec_off + pmdec * t_yr
-
     AL_star = dra * pt.sin(scan_angle) + ddec * pt.cos(scan_angle) + parallax_mas * parallax_factor
     return AL_star
 
 
-
 def planet_model(
-    t_tcb_days,
-    scan_angle,
-    parallax_factor,
-    ra_off,
-    dec_off,
-    pmra,
-    pmdec,
-    parallax_mas,
-    semimajor_au,
-    inclination_deg,
-    eccentricity,
-    Omega_deg,
-    omega_deg,
-    t_p_yr,
-    Mp,
-    Ms,
-    lum_ratio=0.0,
+    t_tcb_days, scan_angle, parallax_factor,
+    ra_off, dec_off, pmra, pmdec, parallax_mas,
+    semimajor_au, inclination_deg, eccentricity,
+    Omega_deg, omega_deg, t_p_yr,
+    Mp, Ms, lum_ratio=0.0,
 ):
     """
     Gaia AL positions for a star + planet-companion model.
-
-    AL(t) = (ra_off + pmra·t_yr + Δα*_planet(t)) · sin(ψ)
-           + (dec_off + pmdec·t_yr + Δδ_planet(t)) · cos(ψ)
-           + ϖ · f(t)
-
-    parameters
-
-    t_tcb_days      : Gaia TCB days since 2010-01-01  (numpy array or pt tensor)
-    scan_angle      : ψ(t) in radians  (numpy array or pt tensor)
-    parallax_factor : f(t), dimensionless  (numpy array or pt tensor)
-    ra_off          : RA offset at J2016.0 (mas)
-    dec_off         : Dec offset at J2016.0 (mas)
-    pmra            : proper motion in RA·cos(Dec) (mas/yr)
-    pmdec           : proper motion in Dec (mas/yr)
-    parallax_mas    : parallax ϖ (mas)
-
-    Orbital parameters:
-    semimajor_au    : semi-major axis of companion orbit (AU)
-    inclination_deg : orbital inclination (degrees)
-    eccentricity    : orbital eccentricity [0, 1)
-    Omega_deg       : longitude of ascending node (degrees)
-    omega_deg       : argument of periastron (degrees)
-    t_p_yr          : time of periastron passage (years since J2016.0)
-    Mp              : companion mass (solar masses)
-    Ms              : host star mass (solar masses)
-    lum_ratio       : L_companion / L_star  (default 0 for dark companion)
-
-    returns
-    -------
-    AL_planet 
     """
     t_yr = tcb_days_to_yr2016(t_tcb_days)
 
-    # orbital period from Kepler's third law: P² = a³ / (M_total)
-    period_yr = pt.sqrt(semimajor_au ** 3 / (Mp + Ms))
-
-    # semi-major axis in mas: a_mas = a_AU × ϖ
+    period_yr     = pt.sqrt(semimajor_au ** 3 / (Mp + Ms))
     semimajor_mas = semimajor_au * parallax_mas
+    q             = Mp / Ms
 
-    # mass ratio
-    q = Mp / Ms
-
-    # photocenter offsets from orbital motion
     dra_planet, ddec_planet = _photocenter_offset_pt(
         t_yr, semimajor_mas, period_yr, eccentricity,
         inclination_deg, Omega_deg, omega_deg, t_p_yr,
@@ -515,45 +319,33 @@ def planet_model(
     return AL_planet
 
 
-
-
-
-
-
-
-"""
-ruwe.py  —  Part 3: RUWE Calculation
-
-
-    RUWE = sqrt[ Σᵢ (rᵢ / σᵢ)² / (N - 5) ]
-
-r = al_model - H_np @ al_model
-      = (I - H_np) @ al_model
-"""
+# =============================================================================
+# Part 3: RUWE Calculation  — FIXED
+# =============================================================================
 
 import os
 os.environ.setdefault("PYTENSOR_FLAGS", "cxx=")
 
-import numpy as np
-import pytensor.tensor as pt
-
-GAIA_EPOCH_OFFSET_DAYS = 2192.0
-DAYS_PER_YEAR          = 365.25
-
 
 def sigma_al(g_mag: float) -> float:
     """
-    gaia AL single-measurement uncertainty as a function of G magnitude.
+    Gaia AL single-measurement uncertainty as a function of G magnitude.
 
-    σ_AL [mas] = sqrt( σ_floor² + (10^(0.2*(G_eff - 12.09)))² )
+    σ_AL [mas] = sqrt( σ_floor² + (10^(0.2*(G - 12.09)))² )
 
-    σ_floor = 0.029 mas (calibration noise floor).
-    G_eff   = max(G, 13) to avoid underflow for very bright stars.
+    This matches the normalization function used by Gaia internally to
+    compute RUWE (Lindegren et al. 2021, Appendix A).  The photon-noise
+    term 10^(0.2*(G-12.09)) is evaluated at the ACTUAL G magnitude —
+    NOT clipped to G=13.
 
+    The previous code used max(G, 13), which floored σ at ~1.5 mas for
+    all stars brighter than G=13.  For a G~8.5 star the correct σ is
+    ~0.19 mas; the clipped version returned 1.52 mas — 8× too large.
+    This made chi²_planet ~64× too small, so ruwe_model was always ≈ 1
+    regardless of the companion parameters.
     """
-    g_eff      = max(float(g_mag), 13.0)
-    sigma_phot = 10.0 ** (0.2 * (g_eff - 12.09))   
-    sigma_floor = 0.029                              
+    sigma_phot  = 10.0 ** (0.2 * (float(g_mag) - 12.09))
+    sigma_floor = 0.029   # mas — calibration noise floor
     return float(np.sqrt(sigma_floor**2 + sigma_phot**2))
 
 
@@ -561,9 +353,7 @@ def _design_matrix_np(t_tcb_days: np.ndarray,
                        scan_angle: np.ndarray,
                        parallax_factor: np.ndarray) -> np.ndarray:
     """
-    build the N×5 astrometric design matrix in numpy.
-
-    rows: A[i] = [sin(ψᵢ), cos(ψᵢ), f(tᵢ), tᵢ·sin(ψᵢ), tᵢ·cos(ψᵢ)]
+    Build the N×5 astrometric design matrix.
 
     Columns encode sensitivity to (Δα₀, Δδ₀, ϖ, μ_α, μ_δ).
     """
@@ -583,158 +373,151 @@ def _design_matrix_np(t_tcb_days: np.ndarray,
 
 def _hat_matrix_np(A: np.ndarray) -> np.ndarray:
     """
-    OLS hat matrix H = A (AᵀA)⁻¹ Aᵀ  
-
-    residuals = (I - H) y,  so we precompute (I - H) once.
+    OLS hat matrix H = A (AᵀA)⁻¹ Aᵀ
     """
-    ATA      = A.T @ A                    
-    ATA_inv  = np.linalg.inv(ATA)            
-    H        = A @ ATA_inv @ A.T             
+    ATA     = A.T @ A
+    ATA_inv = np.linalg.inv(ATA)
+    H       = A @ ATA_inv @ A.T
     return H
 
 
 def precompute_projection(t_tcb_days: np.ndarray,
                            scan_angle: np.ndarray,
-                           parallax_factor: np.ndarray) -> np.ndarray:
+                           parallax_factor: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
-    precompute the residual projection matrix (I - H) in numpy.
+    Precompute the residual projection matrix (I - H) and the
+    noise-floor chi² contribution in numpy.
 
+    The noise floor term accounts for the fact that even a perfect
+    single-star model has RUWE ≈ 1 due to measurement noise.  For N
+    independent AL observations with variance σ², the projected noise
+    has expected sum-of-squares σ² * trace(I - H) = σ² * (N - 5).
+    Dividing by σ² * (N - 5) gives an expected chi²_reduced = 1, i.e.
+    RUWE_floor = 1.
 
-    parameters
-    t_tcb_days, scan_angle, parallax_factor 
-
-    
-    returns
-    I_minus_H : np.ndarray, shape (N, N)
+    Returns
+    -------
+    I_minus_H     : np.ndarray, shape (N, N)
+        Residual projection matrix.
+    noise_chi2_dof : float
+        trace(I - H) / (N - 5).  For a well-conditioned 5-parameter fit
+        this equals exactly 1.0, but we compute it explicitly so the
+        function generalises to any number of free parameters or
+        degenerate scanning-law configurations.
     """
     A         = _design_matrix_np(t_tcb_days, scan_angle, parallax_factor)
     H         = _hat_matrix_np(A)
     I_minus_H = np.eye(len(t_tcb_days)) - H
-    return I_minus_H
+    N         = len(t_tcb_days)
+    dof       = N - 5
+    # trace(I - H) should equal dof for full-rank A, but compute it
+    # explicitly for robustness.
+    noise_chi2_dof = float(np.trace(I_minus_H)) / dof
+    return I_minus_H, noise_chi2_dof
 
 
 def compute_ruwe(
     al_model,
     I_minus_H: np.ndarray,
+    noise_chi2_dof: float,
     g_mag: float,
     N: int,
 ):
     """
-    model-predicted RUWE 
+    Model-predicted RUWE including the measurement-noise floor.
 
-        r         = (I - H) · al_model          [residuals, mas]
-        RUWE      = sqrt( Σ (rᵢ/σ)² / (N - 5) )
+    Physics
+    -------
+    The actual Gaia AL residuals are:
 
-    parameters
-    al_model  : Synthetic AL positions from single_star() or planet_model().
-    I_minus_H : Precomputed residual projection matrix from precompute_projection().
-    g_mag     : Gaia G magnitude (used for σ_AL).
-    N         : Number of AL observations.
+        r_i = (AL_observed_i) - (best-fit 5-param model)_i
+            = (noise_i + planet_signal_i) - (fit absorbs 5 dof)
 
-                
-    returns
+    In terms of our forward model:
+
+        r_planet = (I - H) @ al_model      [planet excess, mas]
+
+    The noise contributes independently:
+
+        E[Σ (r_noise_i / σ)²] = trace(I - H) = N - 5
+
+    So the full chi²_reduced has two additive parts:
+
+        chi²_red = [Σ (r_planet_i / σ)² + Σ (r_noise_i / σ)²] / (N - 5)
+
+    Taking the expectation over noise realizations:
+
+        E[chi²_red] = chi²_planet / (N-5) + noise_chi2_dof
+
+    where noise_chi2_dof ≈ 1 for a well-conditioned fit.  Therefore:
+
+        RUWE_model = sqrt( chi²_planet/(N-5) + noise_chi2_dof )
+
+    This recovers RUWE ≈ 1 when there is no planet signal, and
+    RUWE > 1 when the planet adds excess AL scatter that cannot be
+    absorbed by the 5-parameter fit.
+
+    Parameters
+    ----------
+    al_model        : PyTensor vector — synthetic AL positions (mas).
+    I_minus_H       : np.ndarray (N, N) — precomputed residual projector.
+    noise_chi2_dof  : float — trace(I-H)/(N-5), ≈ 1.0 for typical fits.
+    g_mag           : float — Gaia G magnitude (sets σ_AL).
+    N               : int — number of AL observations.
+
+    Returns
+    -------
     ruwe_model : PyTensor scalar
-
-    compute residuals = (I - H) @ al_model without ANY pt matrix ops.
-    PyTensor generates broken C code (ssize_t narrowing) for pt.dot and all 2D tensor multiplications 
-    expand the matrix-vector product as a Python-level list comprehension over rows of I_minus_H. Each row is a fixed numpy 1D
-    array, so (row * al_model) is elementwise scalar multiplication — PyTensor only emits scalar C ops which compile fine.
-    pt.stack then assembles the N scalars into a vector.
     """
-
-    residuals = pt.stack([
+    # Planet-induced AL residuals: everything the 5-param fit cannot absorb.
+    # We expand (I-H) @ al_model as a list-comprehension over rows to avoid
+    # the PyTensor C-codegen bug with 2D tensor contractions.
+    residuals_planet = pt.stack([
         pt.sum(pt.as_tensor_variable(row) * al_model)
         for row in I_minus_H.astype("float64")
     ])
 
-    sigma        = sigma_al(g_mag)                  
-    chi2_red     = pt.sum((residuals / sigma) ** 2) / (N - 5)
-    ruwe_model   = pt.sqrt(chi2_red)
+    sigma = sigma_al(g_mag)
+
+    # chi²_reduced from the planet signal alone
+    chi2_planet_dof = pt.sum((residuals_planet / sigma) ** 2) / (N - 5)
+
+    # Add the noise-floor contribution (≈ 1 for a well-conditioned fit).
+    # This is the key fix: without this term, RUWE_model → 0 when the
+    # planet signal is small, making it impossible to match RUWE_obs ~ 1.5.
+    ruwe_model = pt.sqrt(chi2_planet_dof + noise_chi2_dof)
     return ruwe_model
 
 
+# =============================================================================
+# Part 4: Bayesian Inference with PyMC
+# =============================================================================
 
-
-
-
-
-
-"""
-inference.py  —  Part 4: Bayesian Inference with PyMC
-Fits planetary companion parameters to Gaia RUWE using PyMC.
-
-Likelihood
-    RUWE_obs ~ Normal(RUWE_model(θ), σ_RUWE)
-
-
-parameters inferred
-
-astrometric (5-parameter solution offsets):
-    ra_off   : RA offset at J2016.0 [mas]
-    dec_off  : Dec offset at J2016.0 [mas]
-    pmra     : proper motion in RA·cos(Dec) [mas/yr]
-    pmdec    : proper motion in Dec [mas/yr]
-    parallax : parallax ϖ [mas]
-
-orbital:
-    log_a    : log10(semi-major axis [AU])
-    inc      : inclination [deg]
-    ecc      : eccentricity [0, 1)
-    Omega    : longitude of ascending node [deg]
-    omega    : argument of periastron [deg]
-    tp       : time of periastron [yr since J2016.0]
-    log_Mp   : log10(planet mass [Mjup])
-
-noise:
-    log_sigma0 : log10(RUWE jitter term)
-
-"""
-
-import os
-os.environ.setdefault("PYTENSOR_FLAGS", "cxx=")
-
-import numpy as np
-import pytensor.tensor as pt
 import pymc as pm
 import arviz as az
 
-
-MJUP_MSUN = 9.547919e-4          # 1 Jupiter mass in solar masses
-RUWE_ERR  = 0.01                 # approximate uncertainty on published RUWE
-                                  # (Lindegren 2021: ~1% for DR3)
-
+MJUP_MSUN = 9.547919e-4
+RUWE_ERR  = 0.01
 
 
 def build_model(params: dict, Ms: float = 1.0, lum_ratio: float = 0.0):
     """
-    build and return the PyMC model for RUWE-based companion inference.
+    Build and return the PyMC model for RUWE-based companion inference.
 
-    parameters
-    params : dict
-        Output of query_companion() from Part 1. Must contain:
-        t_obs, scan_angle, parallax_factor, pmra, pmdec, parallax,
-        pmra_error, pmdec_error, parallax_error, ra_error, dec_error,
-        ruwe, g_mag.
-    Ms : float
-        Host star mass in solar masses. Default 1.0 (can be refined from
-        spectroscopy or isochrone fitting).
-    lum_ratio : float
-        L_companion / L_star. Default 0 (dark companion).
-
-        
-
-    returns
-    model : pm.Model
-    coords : dict 
+    Parameters
+    ----------
+    params : dict  — output of query_companion().
+    Ms     : float — host star mass in solar masses.
+    lum_ratio : float — L_companion / L_star (0 for dark companion).
     """
-
     t_np   = params["t_obs"].astype("float64")
     psi_np = params["scan_angle"].astype("float64")
     f_np   = params["parallax_factor"].astype("float64")
     N      = len(t_np)
 
-
-    I_minus_H = precompute_projection(t_np, psi_np, f_np)
+    # Precompute (I - H) and the noise floor contribution.
+    # noise_chi2_dof ≈ 1 ensures RUWE_model → 1 with no planet signal.
+    I_minus_H, noise_chi2_dof = precompute_projection(t_np, psi_np, f_np)
 
     t_pt   = pt.as_tensor_variable(t_np)
     psi_pt = pt.as_tensor_variable(psi_np)
@@ -745,96 +528,49 @@ def build_model(params: dict, Ms: float = 1.0, lum_ratio: float = 0.0):
 
     with pm.Model() as model:
 
-   
-        # astrometric priors
-
-        ra_off = pm.Normal(
-            "ra_off",
-            mu=0.0,
-            sigma=5.0 * params["ra_error"],
-        )
-        dec_off = pm.Normal(
-            "dec_off",
-            mu=0.0,
-            sigma=5.0 * params["dec_error"],
-        )
-        pmra = pm.Normal(
-            "pmra",
-            mu=params["pmra"],
-            sigma=5.0 * params["pmra_error"],
-        )
-        pmdec = pm.Normal(
-            "pmdec",
-            mu=params["pmdec"],
-            sigma=5.0 * params["pmdec_error"],
-        )
-        parallax = pm.Normal(
+        # ---- Astrometric priors ----
+        ra_off = pm.Normal("ra_off", mu=0.0, sigma=5.0 * params["ra_error"])
+        dec_off = pm.Normal("dec_off", mu=0.0, sigma=5.0 * params["dec_error"])
+        pmra = pm.Normal("pmra", mu=params["pmra"], sigma=5.0 * params["pmra_error"])
+        pmdec = pm.Normal("pmdec", mu=params["pmdec"], sigma=5.0 * params["pmdec_error"])
+        parallax = pm.TruncatedNormal(
             "parallax",
-            mu=params["parallax"],
+            mu=abs(params["parallax"]) if abs(params["parallax"]) > 0.1 else 1.0,
             sigma=5.0 * params["parallax_error"],
+            lower=0.1,
         )
 
-
-        # orbital priors
-
+        # ---- Orbital priors ----
         log_a = pm.Uniform("log_a", lower=-1.0, upper=2.0)
         a_au  = pm.Deterministic("a_au", 10.0 ** log_a)
 
-        # inclination: uniform in cos(i) → sin prior on i
-        # cos_i ~ Uniform(-1, 1)  :  i ~ arccos(Uniform)
         cos_i = pm.Uniform("cos_i", lower=-1.0, upper=1.0)
         inc   = pm.Deterministic("inc_deg", pt.arccos(cos_i) * 180.0 / np.pi)
 
-        # eccentricity: beta(1.12, 3.09) : astrophysically motivated prior
+        ecc   = pm.Beta("ecc", alpha=1.12, beta=3.09)
 
-        ecc = pm.Beta("ecc", alpha=1.12, beta=3.09)
-
-        # angles
         Omega = pm.Uniform("Omega_deg", lower=0.0, upper=360.0)
         omega = pm.Uniform("omega_deg", lower=0.0, upper=360.0)
 
-        # time of periastron: uniform over one full period
         tp_frac = pm.Uniform("tp_frac", lower=0.0, upper=1.0)
 
-   
-        # planet mass prior
-        # log-uniform from 0.1 Mjup to 80 Mjup (below brown dwarf limit)
-     
+        # ---- Planet mass prior ----
         log_Mp_jup = pm.Uniform("log_Mp_jup", lower=-1.0, upper=np.log10(80.0))
         Mp_jup     = pm.Deterministic("Mp_jup", 10.0 ** log_Mp_jup)
         Mp_msun    = pm.Deterministic("Mp_msun", Mp_jup * MJUP_MSUN)
 
-  
-        # jitter / noise term
-        # accounts for unmodelled noise in RUWE 
+        # ---- Jitter / noise term ----
         log_sigma0 = pm.Uniform("log_sigma0", lower=-3.0, upper=0.0)
         sigma0     = pm.Deterministic("sigma0", 10.0 ** log_sigma0)
 
-
-        # derived quantities
-        # orbital period from kepler's 3rd law
+        # ---- Derived quantities ----
         period_yr = pm.Deterministic(
             "period_yr",
             pt.sqrt(a_au ** 3 / (Mp_msun + Ms))
         )
-
-        # time of periastron in years 
         tp_yr = pm.Deterministic("tp_yr", tp_frac * period_yr)
 
-  
-        # Forward model: planet AL positions (Part 2)
-    
-        """planet_model() includes the star's barycentric reflex motion due
-         to the companion (via the corrected w_eff = q/(1+q) - l/(1+l)
-         weighting). for a dark companion (l=0), this equals q/(1+q),
-         which is the physically correct star-around-barycentre amplitude.
-        
-         the 5-parameter single-star fit cannot absorb orbital motion
-         (especially for periods comparable to or shorter than Gaia's
-         34-month baseline), so this extra wobble leaks through as
-         residuals : elevated RUWE.
-        """
-
+        # ---- Forward model ----
         al_pred = planet_model(
             t_tcb_days      = t_pt,
             scan_angle      = psi_pt,
@@ -855,18 +591,13 @@ def build_model(params: dict, Ms: float = 1.0, lum_ratio: float = 0.0):
             lum_ratio       = lum_ratio,
         )
 
-   
-        # RUWE calculation 
-
+        # ---- RUWE (fixed: now includes noise floor) ----
         ruwe_model = pm.Deterministic(
             "ruwe_model",
-            compute_ruwe(al_pred, I_minus_H, g_mag, N)
+            compute_ruwe(al_pred, I_minus_H, noise_chi2_dof, g_mag, N)
         )
 
-
-        # likelihood
-        # total RUWE uncertainty = RUWE_err (fixed) + sigma0 (jitter)
-
+        # ---- Likelihood ----
         ruwe_sigma = pm.Deterministic(
             "ruwe_sigma",
             pt.sqrt(RUWE_ERR ** 2 + sigma0 ** 2)
@@ -874,14 +605,12 @@ def build_model(params: dict, Ms: float = 1.0, lum_ratio: float = 0.0):
 
         pm.Normal(
             "ruwe_likelihood",
-            mu    = ruwe_model,
-            sigma = ruwe_sigma,
+            mu       = ruwe_model,
+            sigma    = ruwe_sigma,
             observed = ruwe_obs,
         )
 
     return model
-
-
 
 
 def run_inference(
@@ -895,23 +624,7 @@ def run_inference(
     random_seed: int = 42,
 ) -> az.InferenceData:
     """
-    run NUTS sampling on the RUWE companion model.
-
-    parameters
-
-    params       : dict from query_companion() (Part 1)
-    Ms           : host star mass [solar masses]
-    lum_ratio    : L_companion / L_star (0 for dark companion)
-    n_draws      : posterior samples per chain
-    n_tune       : tuning steps per chain
-    n_chains     : number of parallel chains
-    target_accept: NUTS target acceptance rate (higher = smaller steps)
-    random_seed  : for reproducibility
-
-    returns
-
-    idata : arviz.InferenceData
-        Contains posterior, sample_stats, and observed_data groups.
+    Run NUTS sampling on the RUWE companion model.
     """
     model = build_model(params, Ms=Ms, lum_ratio=lum_ratio)
 
@@ -919,17 +632,16 @@ def run_inference(
         print(f"\nSampling {n_chains} chains × {n_draws} draws "
               f"(+ {n_tune} tuning steps each)...")
         idata = pm.sample(
-            draws          = n_draws,
-            tune           = n_tune,
-            chains         = n_chains,
-            target_accept  = target_accept,
-            random_seed    = random_seed,
-            progressbar    = True,
+            draws                = n_draws,
+            tune                 = n_tune,
+            chains               = n_chains,
+            target_accept        = target_accept,
+            random_seed          = random_seed,
+            progressbar          = True,
             return_inferencedata = True,
         )
 
     return idata
-
 
 
 def print_posterior_summary(idata: az.InferenceData) -> None:
@@ -939,10 +651,7 @@ def print_posterior_summary(idata: az.InferenceData) -> None:
         "a_au", "inc_deg", "ecc", "Omega_deg", "omega_deg",
         "Mp_jup", "period_yr", "sigma0", "ruwe_model",
     ]
-
-    present = [v for v in var_names
-               if v in idata.posterior.data_vars]
-
+    present = [v for v in var_names if v in idata.posterior.data_vars]
     summary = az.summary(idata, var_names=present, round_to=4)
     print("\n" + "=" * 70)
     print("  Posterior summary")
@@ -950,29 +659,28 @@ def print_posterior_summary(idata: az.InferenceData) -> None:
     print(summary.to_string())
     print("=" * 70 + "\n")
 
-    # convergence diagnostics
     rhat = az.rhat(idata, var_names=present)
-    max_rhat = float(max(rhat[v].values.max() for v in present
-                         if v in rhat.data_vars))
+    max_rhat = float(max(rhat[v].values.max() for v in present if v in rhat.data_vars))
     print(f"  Max R-hat : {max_rhat:.4f}  (< 1.01 is good)")
 
     ess = az.ess(idata, var_names=present)
-    min_ess = float(min(ess[v].values.min() for v in present
-                        if v in ess.data_vars))
+    min_ess = float(min(ess[v].values.min() for v in present if v in ess.data_vars))
     print(f"  Min ESS   : {min_ess:.0f}   (> 400 is good)")
     print()
 
 
-
-    #test
+# =============================================================================
+# Demo
+# =============================================================================
 
 if __name__ == "__main__":
-    SOURCE_ID = "31958852451968"
+    SOURCE_ID = "203551385701760"
+    Ms = 0.96
 
     params = query_companion(SOURCE_ID)
 
     print("\nRunning prior predictive check (10 samples)...")
-    model = build_model(params, Ms=1.0)
+    model = build_model(params, Ms=Ms)
     with model:
         prior = pm.sample_prior_predictive(samples=10, random_seed=42)
     ruwe_prior = prior.prior["ruwe_model"].values.flatten()
@@ -981,13 +689,13 @@ if __name__ == "__main__":
 
     idata = run_inference(
         params,
-        Ms           = 1.0,
-        lum_ratio    = 0.0,
-        n_draws      = 500,      # increase to ≥2000 for publication
-        n_tune       = 500,
-        n_chains     = 4,
-        target_accept= 0.9,
-        random_seed  = 42,
+        Ms            = Ms,
+        lum_ratio     = 0.0,
+        n_draws       = 3000,
+        n_tune        = 500,
+        n_chains      = 2,
+        target_accept = 0.9,
+        random_seed   = 42,
     )
 
     print_posterior_summary(idata)
@@ -995,4 +703,4 @@ if __name__ == "__main__":
     out_path = f"posterior_{SOURCE_ID}.nc"
     idata.to_netcdf(out_path)
     print(f"Posterior saved to: {out_path}")
-    print("Load with: az.from_netcdf('posterior_927713095040.nc')")
+    print(f"Load with: az.from_netcdf('{out_path}')")
